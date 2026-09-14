@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "sayit.player",
+  "name": "Say It",
+  "version": "1.0.0",
+  "author": "txapotxapa",
+  "description": "Now-speaking indicator and player for the local sayit text-to-speech daemon.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "SayIt.qml"
+  },
+  "barWidget": {
+    "displayName": "Say It",
+    "description": "Shown while sayit speaks. Click pauses, middle-click skips, scroll seeks, right-click opens the player.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Say It local text-to-speech daemon
+After=pipewire.service pipewire-pulse.service
+
+[Service]
+ExecStart=@VENV@/bin/python -u @SRC@/sayitd.py
+Restart=on-failure
+RestartSec=2
+Nice=5
+# Name the stream in the mixer (pipewire-alsa reads this).
+Environment="PIPEWIRE_PROPS={ application.name=\"Say It\" media.role=Accessibility }"
+
+[Install]
+WantedBy=default.target

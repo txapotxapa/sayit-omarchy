@@ -1,0 +1,242 @@
+#!/usr/bin/python3
+"""sayit — speak text through the local sayitd daemon.
+
+Queuing returns immediately; the daemon plays utterances in order. Stdlib only
+so it starts fast; the daemon is started through systemd on first use.
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "sayit.sock"
+SRC = Path(os.path.realpath(__file__)).parent
+SKILL = SRC / "skill/SKILL.md"
+HISTORY = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "sayit/history.jsonl"
+UNIT = "sayit.service"
+
+USAGE = """\
+sayit [options] [TEXT ...]     speak TEXT (or stdin), returns immediately
+sayit selection | clipboard    speak the highlighted text / the clipboard
+sayit pause | resume | toggle | skip | stop | clear
+sayit seek SECONDS             jump within the current utterance (e.g. -10, +15)
+sayit seek --to SECONDS        jump to an absolute position
+sayit status [--json]
+sayit voices                   list voices
+sayit voice [NAME]             show or set the default voice
+sayit speed [X]                show or set the speed (0.5-2.0, applies immediately)
+sayit volume [X]               show or set the volume (0-1.5)
+sayit set KEY VALUE            auto_language, spanish_voice, idle_unload_minutes
+sayit history [-n N]           recently spoken text
+sayit replay [N]               speak history entry N again (1 = latest)
+sayit service start|stop|restart|status|logs
+sayit skill path               path of the coding-agent narration skill"""
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-a", "Say It", "-t", "2500", "Say It", msg],
+                   stderr=subprocess.DEVNULL)
+
+
+def request(payload, start=True, wait_timeout=None):
+    """Send one request; start the daemon if nobody is listening."""
+    deadline = time.monotonic() + 15
+    started = False
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(str(SOCKET))
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            s.close()
+            if not start:
+                raise SystemExit("sayit: service is not running (sayit service start)")
+            if not started:
+                subprocess.run(["systemctl", "--user", "start", UNIT], check=False)
+                started = True
+            if time.monotonic() > deadline:
+                raise SystemExit("sayit: service did not come up; see: sayit service logs")
+            time.sleep(0.1)
+    with s:
+        s.settimeout(wait_timeout)
+        s.sendall((json.dumps(payload) + "\n").encode())
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    lines = [json.loads(l) for l in buf.decode().splitlines() if l.strip()]
+    if not lines:
+        raise SystemExit("sayit: empty reply from service")
+    resp = lines[-1]
+    if not resp.get("ok"):
+        raise SystemExit(f"sayit: {resp.get('error', 'failed')}")
+    return resp
+
+
+def fmt_status(st):
+    out = [f"state:   {st['state']}"]
+    cur = st.get("current")
+    if cur:
+        out.append(f"now:     #{cur['id']} [{cur['voice']}] {cur['position']}s "
+                   f"({cur['synthesized']}/{cur['chunks']} chunks ready)  {cur['text']}")
+    for j in st.get("queue", []):
+        out.append(f"queued:  #{j['id']} [{j['voice']}] {j['text']}")
+    out.append(f"voice:   {st['voice']}  speed {st['speed']}  "
+               f"spanish {st['spanish_voice'] if st['auto_language'] else 'off'}")
+    out.append(f"model:   {'loaded' if st['model_loaded'] else 'not loaded'}"
+               f" (unloads after {st['idle_unload_minutes']:g} min idle)")
+    return "\n".join(out)
+
+
+def read_wl(primary):
+    cmd = ["wl-paste", "--no-newline", "--type", "text"] + (["--primary"] if primary else [])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def history_entries():
+    try:
+        lines = HISTORY.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    return [json.loads(l) for l in reversed(lines) if l.strip()]
+
+
+def speak(text, args, source):
+    payload = {"cmd": "say", "text": text, "voice": args.voice, "speed": args.speed,
+               "lang": args.lang, "replace": args.replace, "source": source,
+               "wait": args.wait}
+    resp = request(payload, wait_timeout=None if args.wait else 20)
+    if args.verbose:
+        print(f"queued #{resp['id']} [{resp['voice']}]", file=sys.stderr)
+
+
+def main():
+    argv = sys.argv[1:]
+    commands = {"selection", "clipboard", "pause", "resume", "toggle", "skip", "stop",
+                "clear", "seek", "status", "voices", "voice", "speed", "volume", "set", "history",
+                "replay", "service", "skill"}
+    first = next((a for a in argv if not a.startswith("-")), None)
+
+    if first in commands and argv[0] == first:
+        cmd, rest = argv[0], argv[1:]
+    elif argv and argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return
+    else:
+        cmd, rest = None, argv
+
+    p = argparse.ArgumentParser(prog="sayit", usage=USAGE, add_help=False)
+    p.add_argument("-v", "--voice")
+    p.add_argument("-s", "--speed", type=float)
+    p.add_argument("-l", "--lang", help="espeak language code, e.g. en-us, es")
+    p.add_argument("-r", "--replace", action="store_true",
+                   help="stop current speech and clear the queue first")
+    p.add_argument("-w", "--wait", action="store_true", help="block until spoken")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("-n", type=int, default=10)
+    p.add_argument("--to", type=float, help="absolute seek position in seconds")
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("rest", nargs="*")
+    args = p.parse_intermixed_args(rest)
+    if args.help:
+        print(USAGE)
+        return
+    rest = args.rest
+
+    if cmd is None:
+        text = " ".join(rest) if rest else ("" if sys.stdin.isatty() else sys.stdin.read())
+        if not text.strip():
+            print(USAGE)
+            sys.exit(2)
+        speak(text, args, "cli")
+
+    elif cmd in ("selection", "clipboard"):
+        text = read_wl(primary=cmd == "selection")
+        if not text.strip():
+            notify("Nothing selected" if cmd == "selection" else "Clipboard has no text")
+            sys.exit(1)
+        args.replace = True
+        speak(text, args, cmd)
+
+    elif cmd in ("pause", "resume", "toggle", "skip", "stop", "clear"):
+        st = request({"cmd": cmd}, start=False)
+        if args.verbose:
+            print(fmt_status(st))
+
+    elif cmd == "seek":
+        if args.to is not None:
+            request({"cmd": "seekto", "arg": args.to}, start=False)
+        elif rest:
+            request({"cmd": "seek", "arg": float(rest[0])}, start=False)
+        else:
+            raise SystemExit("usage: sayit seek SECONDS | sayit seek --to SECONDS")
+
+    elif cmd == "status":
+        st = request({"cmd": "status"})
+        print(json.dumps(st, indent=2) if args.json else fmt_status(st))
+
+    elif cmd == "voices":
+        voices = request({"cmd": "voices"})["voices"]
+        names = {"a": "American English", "b": "British English", "e": "Spanish",
+                 "f": "French", "h": "Hindi", "i": "Italian", "j": "Japanese",
+                 "p": "Portuguese", "z": "Mandarin"}
+        for prefix, lang in names.items():
+            group = [v for v in voices if v.startswith(prefix)]
+            if group:
+                print(f"{lang + ':':18} {' '.join(group)}")
+        print("(f = female, m = male; af_heart is the highest quality English voice)")
+
+    elif cmd in ("voice", "speed", "volume"):
+        if rest:
+            st = request({"cmd": "set", "key": cmd, "value": rest[0]})
+        else:
+            st = request({"cmd": "status"})
+        print(st[cmd])
+
+    elif cmd == "set":
+        if len(rest) != 2:
+            raise SystemExit("usage: sayit set KEY VALUE")
+        print(fmt_status(request({"cmd": "set", "key": rest[0], "value": rest[1]})))
+
+    elif cmd == "history":
+        for i, e in enumerate(history_entries()[:args.n], 1):
+            when = time.strftime("%m-%d %H:%M", time.localtime(e["t"]))
+            text = " ".join(e["text"].split())
+            print(f"{i:3}  {when}  {text[:100] + ('...' if len(text) > 100 else '')}")
+
+    elif cmd == "replay":
+        n = int(rest[0]) if rest else 1
+        entries = history_entries()
+        if not 1 <= n <= len(entries):
+            raise SystemExit(f"sayit: no history entry {n}")
+        args.replace = True
+        speak(entries[n - 1]["text"], args, "replay")
+
+    elif cmd == "service":
+        action = rest[0] if rest else "status"
+        if action == "logs":
+            os.execvp("journalctl", ["journalctl", "--user", "-u", UNIT, "-n", "50", "--no-pager"])
+        if action not in ("start", "stop", "restart", "status"):
+            raise SystemExit("usage: sayit service start|stop|restart|status|logs")
+        os.execvp("systemctl", ["systemctl", "--user", action, UNIT])
+
+    elif cmd == "skill":
+        if rest[:1] != ["path"]:
+            raise SystemExit("usage: sayit skill path")
+        print(SKILL)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
