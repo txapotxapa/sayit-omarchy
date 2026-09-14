@@ -4,6 +4,14 @@ Private, local text-to-speech for [Omarchy](https://omarchy.org) and other
 Linux desktops. Select text anywhere, press **Ctrl+Alt+S**, and a neural
 voice reads it aloud, running entirely on your machine.
 
+<p align="center">
+  <img src="docs/desktop.jpg" alt="Say It reading DHH's post on X aloud on Omarchy, with its player open under the bar icon">
+</p>
+
+<p align="center">
+  <img src="docs/player.gif" width="400" alt="The Say It player: waveform, controls, and each word highlighted as it is spoken">
+</p>
+
 ## Features
 
 - **Speak from anywhere.** Ctrl+Alt+S reads the highlighted text (no copy
